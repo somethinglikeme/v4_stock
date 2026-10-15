@@ -42,16 +42,21 @@ if __name__ == "__main__":
     if "--check" in args:
         preflight()
     elif "--morning" in args:
+        print(f"=== 장중 주문 접수 시작 (LIVE: {live}) ===")
         for s in syms:
             try:
                 morning_for_symbol(s, not live, today)
             except Exception as e:
+                print(f"❌ [{s}] 오류 발생: {e}")
                 send_telegram(f"❌ [{s}] 주문 오류: {e}")
+        print("=== 처리 완료 ===")        
     elif "--aftermarket" in args:
+        print(f"=== 장 마감 후 정산 시작 (LIVE: {live}) ===")
         for s in syms:
             try:
                 reconcile_for_symbol(s, not live)
             except Exception as e:
+                print(f"❌ [{s}] 정산 오류: {e}")
                 send_telegram(f"❌ [{s}] 정산 오류: {e}")
     else:
         print(__doc__)

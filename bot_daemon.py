@@ -59,7 +59,7 @@ def is_trading_day(d) -> bool:
 
 # 주문 type -> 증권사 주문 종류
 def order_kind(o: dict) -> str:
-    if o.get("moc") or o["type"] == "first_buy":
+    if o.get("moc"): #or o["type"] == "first_buy":
         return "MOC"
     if o["type"] == "limit_sell":
         return "LIMIT"
@@ -84,10 +84,13 @@ def morning_for_symbol(symbol: str, dry_run: bool, today: str):
     compound = cfg.get("compound", False)
     tag = "[DRY] " if dry_run else ""
     state = load_state(symbol, principal)
+    print(f"[{symbol}] 장중 주문 처리 시작 (날짜: {today})...")
 
     if state.order_date == today and not state.pending:
+        print(f"[{symbol}] 이미 오늘({today}) 주문 처리가 완료되었습니다.")
         return
     if state.pending:
+        print(f"[{symbol}] 미정산 주문이 존재합니다 (접수일: {state.order_date}).")
         if state.order_date != today:
             send_telegram(f"⛔ [{symbol}] {state.order_date} 주문이 미정산 상태라 신규 주문을 중단했습니다. 정산(체결 반영) 후 재개됩니다.")
         return
@@ -251,7 +254,7 @@ def tick(dry_run: bool):
     # 미정산 주문은 날짜가 지났거나 정산 시각이 지났으면 언제든 정산
     for sym in PORTFOLIO:
         st = load_state(sym, get_config(sym)["principal"])
-        if st.pending and (st.order_date < today or now.time() >= RECONCILE_TIME):
+        if st.pending and ((st.order_date and st.order_date < today) or now.time() >= RECONCILE_TIME):
             _run(("reconcile", sym, st.order_date, today), reconcile_for_symbol, sym, dry_run)
     if not is_trading_day(now.date()):
         return

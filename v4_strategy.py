@@ -73,8 +73,10 @@ def calc_buy_orders(state: V4State, target_pct: float, splits: int, principal: f
 
     if state.hold_qty == 0:
         qty = math.floor(one_amount / last_close)
-        return [{"type": "first_buy", "price": None, "qty": qty,
-                 "amount": _r2(one_amount), "moc": True}]
+        # 메리츠 MOC 미지원 방어: 전일 종가의 +15% 가격 설정 (LOC 주문용)
+        first_buy_price = _r2(last_close * 1.15)
+        return [{"type": "first_buy", "price": first_buy_price, "qty": qty,
+                 "amount": _r2(one_amount), "moc": False}]
 
     star_point = calc_star_point(state.avg_price, target_pct, state.T, splits)
     buy_point = star_point - 0.01
