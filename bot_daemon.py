@@ -1,15 +1,17 @@
-"""V4 통합 자동매매 데몬 (패치본)
+"""V4 통합 자동매매 데몬
 
 - 스케줄은 미국 동부시간(ET) 기준 -> 서머타임 자동 반영, 주말/휴장일 건너뜀
 - 기본은 DRY-RUN. 실주문은 환경변수 LIVE_TRADING=1 일 때만.
-- 중복 주문 방지: 주문 접수 의도를 먼저 state 에 저장(order_date/pending) -> 재시작해도 같은 날 재주문 없음
-- 정산은 '실제 체결'로만 수행. 체결 조회 API 미구현 시 manual_fills_<SYMBOL>.json 사용
+- 중복 주문 방지: 주문 접수 의도를 먼저 state 에 저장(order_date/pending), 주문 직전 증권사 보유수량 대조
+- 정산은 메리츠 주문체결 조회(기간)로 '실제 체결'만 반영. 대체 수단: manual_fills_<SYMBOL>.json
+- 기록: orders.csv(주문) / daily.csv(정산) / cycles.csv(사이클) -> 대시보드용
+- 알림: 시작 상태, 주문 접수, 장 마감 정산, 사이클 종료, 이상 알림, 하루 1회 하트비트
 """
 import csv
 import json
 import os
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -20,7 +22,8 @@ from config import PORTFOLIO, get_config
 from storage import BASE_DIR, load_state, save_state
 from v4_strategy import (calc_buy_orders, calc_sell_orders, calc_reverse_orders,
                          update_mode, record_orders, reconcile)
-from meritz_wrapper import get_last_close_yfinance, place_overseas_order, get_order_results, get_position, KST
+from meritz_wrapper import (get_last_close_yfinance, place_overseas_order, get_order_results,
+                            get_position, get_usd_orderable, KST)
 from telegram_bot import send_telegram
 
 ET = ZoneInfo("America/New_York")
@@ -32,12 +35,12 @@ def _t(name, default):
     return dtime(int(h), int(m))
 
 
-ORDER_TIME = _t("ORDER_TIME_ET", "09:35")        # 장 시작 직후 주문 접수
-ORDER_CUTOFF = _t("ORDER_CUTOFF_ET", "15:30")     # 이 시각 이후엔 신규 주문 안 함
-RECONCILE_TIME = _t("RECONCILE_TIME_ET", "16:20")  # 장 마감 후 정산
+ORDER_TIME = _t("ORDER_TIME_ET", "09:35")          # 장 시작 직후 주문 접수
+ORDER_CUTOFF = _t("ORDER_CUTOFF_ET", "15:30")       # 이 시각 이후엔 신규 주문 안 함
+RECONCILE_TIME = _t("RECONCILE_TIME_ET", "16:20")   # 장 마감 후 정산
+HEARTBEAT_TIME = _t("HEARTBEAT_TIME_KST", "21:00")  # 하루 1회 상태 알림 (KST)
 MAX_ATTEMPTS = 6
 RETRY_SEC = 600
-DASHBOARD_FILE = os.path.join(BASE_DIR, "dashboard_data.csv")
 
 try:
     import exchange_calendars as _xcals
@@ -57,22 +60,135 @@ def is_trading_day(d) -> bool:
     return True
 
 
-# 주문 type -> 증권사 주문 종류
+# ------------------------------------------------------------------
+# 주문 종류 / 표시
+# ------------------------------------------------------------------
+BUY_TYPES = ("first_buy", "star_buy", "avg_buy", "reverse_buy")
+KIND_KOR = {"LOC": "LOC", "LIMIT": "지정가", "MOC": "MOC"}
+TYPE_KOR = {"first_buy": "첫 매수", "star_buy": "별지점", "avg_buy": "평단", "reverse_buy": "리버스",
+            "limit_sell": "3/4 목표가", "quarter_sell": "1/4 별지점", "reverse_sell": "리버스"}
+
+
 def order_kind(o: dict) -> str:
-    if o.get("moc"): #or o["type"] == "first_buy":
+    if o.get("moc"):
         return "MOC"
     if o["type"] == "limit_sell":
         return "LIMIT"
     return "LOC"
 
 
-def save_to_dashboard(log_data: dict):
-    exists = os.path.isfile(DASHBOARD_FILE)
-    with open(DASHBOARD_FILE, "a", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(log_data.keys()))
+def side_of(o: dict) -> str:
+    return "BUY" if o["type"] in BUY_TYPES else "SELL"
+
+
+def kind_side_kor(o: dict) -> str:       # 예) "LOC 매수"
+    return f"{KIND_KOR[order_kind(o)]} {'매수' if side_of(o) == 'BUY' else '매도'}"
+
+
+FILL_ORDER = ["first_buy", "star_buy", "avg_buy", "reverse_buy", "quarter_sell", "limit_sell", "reverse_sell"]
+
+
+def fill_label(t: str) -> str:           # 정산 메시지용 (체결된 type)
+    if t == "first_buy":
+        return "첫 매수"
+    return f"{TYPE_KOR[t]} {'매수' if t in BUY_TYPES else '매도'}"
+
+
+def money(x, nd=2) -> str:
+    return f"${x:,.{nd}f}"
+
+
+def pct(x) -> str:
+    return "-" if x is None else f"{x:+.2f}%"
+
+
+# ------------------------------------------------------------------
+# 기록 (대시보드용 CSV)
+# ------------------------------------------------------------------
+ORDERS_FIELDS = ["date_kst", "order_date_et", "symbol", "type", "label", "kind", "side", "price", "qty",
+                 "amount", "order_no", "status", "error", "T", "hold_qty", "avg_price"]
+DAILY_FIELDS = ["filled_at_kst", "order_date_et", "symbol", "fill_types", "fill_qty", "buy_qty", "buy_price",
+                "sell_qty", "sell_price", "eval_price", "total_qty", "avg_price", "splits", "T_before", "T",
+                "invested_amt", "cash_left", "return_pct", "cum_return_pct", "broker_qty", "broker_match"]
+CYCLES_FIELDS = ["symbol", "splits", "start_date", "end_date", "days", "total_buy_amt", "profit",
+                 "return_pct", "cash_after"]
+
+
+def append_csv(name: str, fields: list, row: dict):
+    path = os.path.join(BASE_DIR, name)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            header = next(csv.reader(f), [])
+        if header != fields:   # 컬럼이 바뀌면 기존 파일은 보존하고 새로 시작
+            os.replace(path, path + f".old_{datetime.now():%Y%m%d%H%M%S}")
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         if not exists:
             w.writeheader()
-        w.writerow(log_data)
+        w.writerow(row)
+
+
+# ------------------------------------------------------------------
+# 상태 요약 (시작 메시지 / 하트비트 / main.py --status)
+# ------------------------------------------------------------------
+def next_order_kst(ordered_today: bool):
+    now = datetime.now(ET)
+    d = now.date()
+    if ordered_today or now.time() >= ORDER_CUTOFF:
+        d += timedelta(days=1)
+    while not is_trading_day(d):
+        d += timedelta(days=1)
+    dt = datetime.combine(d, ORDER_TIME, tzinfo=ET).astimezone(KST)
+    return "접수 시간대 진행 중 (곧 접수)" if dt <= datetime.now(KST) else dt.strftime("%m/%d %H:%M KST")
+
+
+def build_status(title: str) -> str:
+    now = datetime.now(ET)
+    kst = lambda t: datetime.combine(now.date(), t, tzinfo=ET).astimezone(KST).strftime("%H:%M")
+    mode = "LIVE(실주문)" if LIVE_TRADING else "DRY-RUN(주문/저장 안 함)"
+    lines = [f"{title} [{mode}]",
+             f"주문 {ORDER_TIME:%H:%M} ET ({kst(ORDER_TIME)} KST) / 정산 {RECONCILE_TIME:%H:%M} ET ({kst(RECONCILE_TIME)} KST)"]
+    if _CAL is None:
+        lines.append("⚠️ exchange_calendars 미설치: 휴장일을 거르지 못합니다 (pip install exchange_calendars)")
+    try:
+        lines.append(f"USD 주문가능: {money(get_usd_orderable())}")
+    except Exception as e:
+        lines.append(f"USD 주문가능: 조회 실패 ({str(e)[:60]})")
+    ordered = True
+    skip_check = os.getenv("V4_SKIP_BALANCE_CHECK", "0") == "1"
+    for sym in PORTFOLIO:
+        cfg = get_config(sym)
+        try:
+            st = load_state(sym, cfg["principal"])
+        except Exception as e:
+            lines += ["", f"[{sym}] ⚠️ 장부 읽기 실패: {e}"]
+            continue
+        ordered &= (st.order_date == now.date().isoformat())
+        lines += ["", f"[{sym}] {cfg['splits']}분할 · 목표 +{cfg['target_pct']}%",
+                  f"- 장부: T {st.T:.3f} · {st.hold_qty}주 · 평단 {money(st.avg_price)} · 남은금액 {money(st.cash)}"
+                  f" · {'리버스' if st.is_reverse else '일반모드'}"]
+        try:
+            pos = get_position(sym)
+            if int(round(pos["qty"])) == st.hold_qty:
+                lines.append(f"- 증권사: {pos['qty']:g}주 ✅ 일치")
+            else:
+                note = "대조 생략 설정" if skip_check else "일치할 때까지 주문 중단"
+                lines.append(f"- 증권사: {pos['qty']:g}주 ⚠️ 장부와 불일치 ({note})")
+        except Exception as e:
+            lines.append(f"- 증권사: 조회 실패 ({str(e)[:60]})")
+        try:
+            last, _ = get_last_close_yfinance(sym)
+            vs = f" (평단 대비 {(last / st.avg_price - 1) * 100:+.1f}%)" if st.avg_price > 0 else ""
+            lines.append(f"- 직전 종가 {money(last)}{vs}")
+        except Exception as e:
+            lines.append(f"- 직전 종가: 조회 실패 ({str(e)[:60]})")
+        if st.pending:
+            lines.append(f"- 미정산 주문 {len(st.pending)}건 (접수일 {st.order_date}) → 정산 대기")
+        elif st.order_date == now.date().isoformat():
+            lines.append("- 오늘 주문 접수 완료")
+    lines += ["", f"다음 주문: {next_order_kst(ordered)}"]
+    return "\n".join(lines)
 
 
 # ==========================================
@@ -130,12 +246,25 @@ def morning_for_symbol(symbol: str, dry_run: bool, today: str):
         save_state(symbol, state)  # 접수 '의도'를 먼저 저장 -> 중간에 죽어도 중복 주문 없음
 
     if not orders:
-        send_telegram(f"{tag}[{symbol}] 오늘은 접수할 주문이 없습니다.")
+        send_telegram(f"{tag}[{symbol}] 오늘은 접수할 주문이 없습니다. (T {state.T:.3f} · 보유 {state.hold_qty}주)")
     for o in state.pending:
-        side = "BUY" if o["type"] in ("first_buy", "star_buy", "avg_buy", "reverse_buy") else "SELL"
-        kind = order_kind(o)
-        price_txt = "MOC(종가 시장가)" if kind == "MOC" else f"${o['price']} ({kind})"
-        msg = f"📤 {tag}[{symbol} 주문 접수]\n- 주문종류: {o['type']} ({side})\n- 단가: {price_txt}\n- 수량: {o['qty']}주"
+        side, kind = side_of(o), order_kind(o)
+        if o.get("at_close"):
+            price_txt = f"종가 체결 (LOC 한도 {money(o['price'])})"
+            est_txt = f"≈{money(o['qty'] * last_close)} (직전 종가 기준)"
+        elif kind == "MOC":
+            price_txt, est_txt = "종가 (MOC)", f"≈{money(o['qty'] * last_close)}"
+        else:
+            price_txt, est_txt = money(o["price"]), money(o["qty"] * o["price"])
+        msg = (f"📤 {tag}[{symbol} 주문 접수] {kind_side_kor(o)} ({TYPE_KOR[o['type']]})\n"
+               f"- 종목: {symbol}\n- 주문종류: {kind_side_kor(o)}\n- 단가: {price_txt}\n"
+               f"- 수량: {o['qty']}주\n- 주문금액: {est_txt}\n"
+               f"- 현재: T {state.T:.3f} · 보유 {state.hold_qty}주 · 평단 {money(state.avg_price)}")
+        row = {"date_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), "order_date_et": today, "symbol": symbol,
+               "type": o["type"], "label": kind_side_kor(o), "kind": kind, "side": side,
+               "price": o.get("price") or "", "qty": o["qty"],
+               "amount": round(o["qty"] * (last_close if o.get("at_close") else (o.get("price") or last_close)), 2),
+               "T": round(state.T, 3), "hold_qty": state.hold_qty, "avg_price": round(state.avg_price, 2)}
         if dry_run:
             send_telegram(msg)
             continue
@@ -144,8 +273,11 @@ def morning_for_symbol(symbol: str, dry_run: bool, today: str):
         o["placed"], o["order_no"] = bool(r.get("ok")), r.get("order_no")
         if r.get("ok"):
             send_telegram(msg)
+            append_csv("orders.csv", ORDERS_FIELDS, dict(row, order_no=o["order_no"], status="접수"))
         else:
-            send_telegram(f"❌ [{symbol}] 주문 실패 ({o['type']} {o['qty']}주): {r.get('error') or r.get('msg')}")
+            err = r.get("error") or r.get("msg")
+            send_telegram(f"❌ [{symbol}] 주문 실패 ({kind_side_kor(o)} {o['qty']}주): {err}")
+            append_csv("orders.csv", ORDERS_FIELDS, dict(row, status="실패", error=err))
     if not dry_run:
         save_state(symbol, state)
 
@@ -154,7 +286,7 @@ def morning_for_symbol(symbol: str, dry_run: bool, today: str):
 # 2. 장 마감 정산 (실제 체결 기준)
 # ==========================================
 def collect_fills(symbol: str, state) -> list:
-    """정산용 체결 리스트 [{type, qty, price}]."""
+    """정산용 체결 리스트 [{type, qty, price, filled_at?}]."""
     manual = os.path.join(BASE_DIR, f"manual_fills_{symbol}.json")
     if os.path.exists(manual):
         with open(manual, "r", encoding="utf-8") as f:
@@ -171,10 +303,22 @@ def collect_fills(symbol: str, state) -> list:
     for o in placed:
         r = results[str(o["order_no"])]
         if r["rejected"]:
-            send_telegram(f"⚠️ [{symbol}] 주문 거부됨 ({o['type']} #{o['order_no']}): {r['reason']}")
+            send_telegram(f"⚠️ [{symbol}] 주문 거부됨 ({kind_side_kor(o)} #{o['order_no']}): {r['reason']}")
         if r["qty"] > 0:
-            out.append({"type": o["type"], "qty": r["qty"], "price": r["price"]})
+            out.append({"type": o["type"], "qty": r["qty"], "price": r["price"], "filled_at": r.get("filled_at", "")})
     return out
+
+
+def eval_price(symbol: str, fills: list, state):
+    """평가 가격 = 체결가. LOC 체결(종가)이 있으면 그 가격, 없으면 지정가 체결가. 체결이 없으면 당일 종가."""
+    ok = [f for f in fills if f.get("qty", 0) > 0 and f.get("price", 0) > 0]
+    pick = [f for f in ok if f["type"] != "limit_sell"] or ok
+    if pick:
+        return float(pick[-1]["price"]), "체결가"
+    try:
+        return float(get_last_close_yfinance(symbol, include_today=True)[0]), "종가"
+    except Exception:
+        return (state.recent_closes[-1] if state.recent_closes else 0.0), "직전 종가"
 
 
 def reconcile_for_symbol(symbol: str, dry_run: bool):
@@ -184,54 +328,95 @@ def reconcile_for_symbol(symbol: str, dry_run: bool):
     if not state.pending:
         return
     fills = collect_fills(symbol, state)
-    pending_dates = state.order_date
-    prev_hold = state.hold_qty
-    s = reconcile(state, fills, splits)
+    order_date, prev_avg = state.order_date, state.avg_price
+    s = reconcile(state, fills, splits, trade_date=order_date)
+    price, price_src = eval_price(symbol, fills, state)
 
-    ref_price = s["sell_price"] or s["buy_price"] or (state.recent_closes[-1] if state.recent_closes else 0.0)
-    ret = ((ref_price / state.avg_price) - 1) * 100 if state.avg_price > 0 and ref_price else 0.0
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    fill_qty = s["buy_qty"] + s["sell_qty"]
-    log = {
-        "date": now_str, "order_date": pending_dates, "symbol": symbol,
-        "fill_type": "+".join(s["filled_types"]) or "none",
-        "fill_qty": fill_qty,
-        "fill_price": round(ref_price, 4) if fill_qty else 0.0,
-        "total_qty": state.hold_qty, "avg_price": round(state.avg_price, 2), "T": round(state.T, 3),
-        "invested_amt": round(state.hold_qty * state.avg_price, 2),
-        "cash_left": round(state.cash, 2), "return_pct": round(ret, 2),
-    }
+    end = s["cycle_end"]
+    invested = s["cycle_buy_amt"] if end else (state.cycle_buy_amt or state.hold_qty * state.avg_price)
+    start_cash = s["cycle_start_cash"] if end else state.cycle_start_cash
+    cur_ret = ((price / state.avg_price) - 1) * 100 if state.avg_price > 0 and price else None
+    if end:
+        cum_ret = s["cycle_return_pct"]
+    elif invested > 0 and start_cash > 0 and price:
+        cum_ret = (state.hold_qty * price + state.cash - start_cash) / invested * 100
+    else:
+        cum_ret = None
+
+    broker_qty, match_txt = "", "대조 안 함"
     if not dry_run:
-        save_to_dashboard(log)
+        try:
+            pos = get_position(symbol)
+            broker_qty = pos["qty"]
+            if int(round(pos["qty"])) == state.hold_qty:
+                match_txt = f"{pos['qty']:g}주 ✅ 일치"
+            else:
+                match_txt = f"{pos['qty']:g}주 ⚠️ 불일치 (장부 {state.hold_qty}주, 증권사 평단 {money(pos['avg'])}) - 확인 필요"
+        except Exception as e:
+            match_txt = f"조회 실패 ({str(e)[:60]})"
+
+    filled_times = [f["filled_at"] for f in fills if f.get("filled_at")]
+    if filled_times:
+        when = f"{max(filled_times)} KST (미국장 {order_date})"
+        when_csv = max(filled_times)
+    else:
+        when_csv = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+        when = f"{when_csv} KST (정산 시각 · 미국장 {order_date})"
 
     if not s["filled_types"]:
-        msg = f"📥 [{symbol} 장 마감 정산]\n- 체결여부: X (체결 없음)\n- 현재회차(T): {state.T:.3f}\n- 누적개수: {state.hold_qty}주"
+        msg = (f"📥 [{symbol} 장 마감 정산]\n- 체결종목: {symbol}\n- 체결여부: X (체결 없음) · {price_src} {money(price)}\n"
+               f"- 누적개수: {state.hold_qty}주 · 평단 {money(state.avg_price)} · T {state.T:.3f}\n"
+               f"- 전체분할수: {splits}분할\n- 누적매수액: {money(invested)} · 남은금액: {money(state.cash)}\n"
+               f"- 현재수익률: {pct(cur_ret)} · 누적수익률: {pct(cum_ret)}\n- 증권사 잔고: {match_txt}")
     else:
-        msg = (f"📥 [{symbol} 장 마감 정산]\n- 체결여부: O ({', '.join(s['filled_types'])})\n"
-               f"- 체결일시: {now_str}\n"
-               f"- 매수체결: {s['buy_qty']}주 @ ${s['buy_price']:.2f}\n"
-               f"- 매도체결: {s['sell_qty']}주 @ ${s['sell_price']:.2f}\n"
-               f"- 누적개수: {state.hold_qty}주\n- 평균단가: ${log['avg_price']}\n"
-               f"- 전체분할수: {splits}분할\n- 현재회차(T): {s['T_before']:.3f} -> {state.T:.3f}\n"
-               f"- 누적매수액: ${log['invested_amt']}\n- 남은금액: ${log['cash_left']}\n"
-               f"- 현재수익률: {log['return_pct']}%")
+        labels = " · ".join(fill_label(t) for t in sorted(s["filled_types"], key=FILL_ORDER.index))
+        px = []
+        if s["buy_qty"]:
+            px.append(f"매수 {money(s['buy_price'])}")
+        if s["sell_qty"]:
+            px.append(f"매도 {money(s['sell_price'])}")
+        qty_txt = " / ".join(x for x in (f"매수 {s['buy_qty']}주" if s["buy_qty"] else "",
+                                         f"매도 {s['sell_qty']}주" if s["sell_qty"] else "") if x)
+        avg_txt = money(state.avg_price) if state.hold_qty else "-"
+        msg = (f"📥 [{symbol} 장 마감 정산]\n- 체결종목: {symbol}\n- 체결여부: O ({labels})\n- 체결일시: {when}\n"
+               f"- 체결가격: {' / '.join(px)}\n- 체결개수: {qty_txt}\n- 누적개수: {state.hold_qty}주\n"
+               f"- 평균단가: {avg_txt}" + (f" (이전 {money(prev_avg)})" if prev_avg and state.hold_qty else "") + "\n"
+               f"- 전체분할수: {splits}분할\n- 현재회차(T): {s['T_before']:.3f} → {state.T:.3f}\n"
+               f"- 누적매수액: {money(invested)}\n- 남은금액: {money(state.cash)}\n"
+               f"- 현재수익률: {pct(cur_ret)} (평단 대비, 평가가 {money(price)} {price_src} 기준)\n"
+               f"- 누적수익률: {pct(cum_ret)} (사이클 누적)\n- 증권사 잔고: {match_txt}")
     if s["warnings"]:
         msg += "\n⚠️ " + " / ".join(s["warnings"])
     send_telegram(msg)
 
     if not dry_run:
-        try:
-            pos = get_position(symbol)
-            if int(round(pos["qty"])) != state.hold_qty:
-                send_telegram(f"⚠️ [{symbol}] 잔고 불일치: 증권사 {pos['qty']:g}주 vs 장부 {state.hold_qty}주 (평단 증권사 ${pos['avg']:.2f} / 장부 ${state.avg_price:.2f}) - 확인 필요")
-        except Exception as e:
-            send_telegram(f"⚠️ [{symbol}] 잔고 대조 실패: {e}")
+        append_csv("daily.csv", DAILY_FIELDS, {
+            "filled_at_kst": when_csv, "order_date_et": order_date, "symbol": symbol,
+            "fill_types": "+".join(s["filled_types"]) or "none",
+            "fill_qty": s["buy_qty"] + s["sell_qty"], "buy_qty": s["buy_qty"], "buy_price": round(s["buy_price"], 4),
+            "sell_qty": s["sell_qty"], "sell_price": round(s["sell_price"], 4), "eval_price": round(price, 4),
+            "total_qty": state.hold_qty, "avg_price": round(state.avg_price, 2), "splits": splits,
+            "T_before": round(s["T_before"], 3), "T": round(state.T, 3), "invested_amt": round(invested, 2),
+            "cash_left": round(state.cash, 2), "return_pct": "" if cur_ret is None else round(cur_ret, 2),
+            "cum_return_pct": "" if cum_ret is None else round(cum_ret, 2), "broker_qty": broker_qty,
+            "broker_match": match_txt.startswith(f"{broker_qty:g}주 ✅") if broker_qty != "" else ""})
 
-    if s["cycle_end"]:
-        send_telegram(f"🎉 [{symbol} 한 사이클 종료!]\n- 전체분할수: {splits}분할\n"
-                      f"- 총 누적매수액: ${s['cycle_buy_amt']:.2f}\n"
-                      f"- 총 누적수익률: {s['cycle_return_pct']:.2f}%\n"
-                      f"- 총 누적수익액: ${s['cycle_profit']:.2f}\n- 정산 후 현금: ${state.cash:.2f}")
+    if end:
+        start = s["cycle_start_date"]
+        try:
+            days = (datetime.fromisoformat(order_date) - datetime.fromisoformat(start)).days + 1
+            period = f"{start} ~ {order_date} ({days}일)"
+        except Exception:
+            days, period = "", f"{start or '시작일 미상'} ~ {order_date}"
+        send_telegram(f"🎉 [{symbol} 한 사이클 종료!]\n- 매매종목: {symbol}\n- 전체분할수: {splits}분할\n"
+                      f"- 총누적매수액: {money(s['cycle_buy_amt'])}\n- 총누적수익률: {pct(s['cycle_return_pct'])}\n"
+                      f"- 총누적수익액: {'+' if s['cycle_profit'] >= 0 else '-'}{money(abs(s['cycle_profit']))}\n"
+                      f"- 기간: {period}\n- 정산 후 현금: {money(state.cash)} · 다음 사이클 첫 매수 대기")
+        if not dry_run:
+            append_csv("cycles.csv", CYCLES_FIELDS, {
+                "symbol": symbol, "splits": splits, "start_date": start, "end_date": order_date, "days": days,
+                "total_buy_amt": round(s["cycle_buy_amt"], 2), "profit": round(s["cycle_profit"], 2),
+                "return_pct": round(s["cycle_return_pct"], 2), "cash_after": round(state.cash, 2)})
     if not dry_run:
         save_state(symbol, state)
 
@@ -240,6 +425,7 @@ def reconcile_for_symbol(symbol: str, dry_run: bool):
 # 3. 스케줄러
 # ==========================================
 _attempts = {}   # key -> (count, last_ts)
+_hb = {"date": None}
 
 
 def _run(key, fn, *args):
@@ -258,6 +444,13 @@ def _run(key, fn, *args):
 def tick(dry_run: bool):
     now = datetime.now(ET)
     today = now.date().isoformat()
+    now_kst = datetime.now(KST)
+    if now_kst.time() >= HEARTBEAT_TIME and _hb["date"] != now_kst.date():
+        _hb["date"] = now_kst.date()        # 실패해도 하루 1회만
+        try:
+            send_telegram(build_status("💓 V4 데몬 정상 가동"))
+        except Exception as e:
+            print("heartbeat error:", e)
     # 미정산 주문은 날짜가 지났거나 정산 시각이 지났으면 언제든 정산
     for sym in PORTFOLIO:
         st = load_state(sym, get_config(sym)["principal"])
@@ -272,9 +465,11 @@ def tick(dry_run: bool):
 
 def main_loop():
     dry = not LIVE_TRADING
-    mode = "DRY-RUN(주문/저장 안 함)" if dry else "LIVE(실주문)"
-    cal = "" if _CAL else "\n⚠️ exchange_calendars 미설치: 주말만 거르고 휴장일은 못 거릅니다 (pip install exchange_calendars)"
-    send_telegram(f"🤖 V4 데몬 시작 [{mode}] 주문 {ORDER_TIME:%H:%M} ET / 정산 {RECONCILE_TIME:%H:%M} ET{cal}")
+    try:
+        send_telegram(build_status("🤖 V4 데몬 시작"))
+    except Exception as e:
+        send_telegram(f"🤖 V4 데몬 시작 (상태 조회 실패: {e})")
+    _hb["date"] = datetime.now(KST).date()     # 시작 메시지가 오늘의 하트비트를 대신함
     while True:
         try:
             tick(dry)

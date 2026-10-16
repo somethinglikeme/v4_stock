@@ -25,7 +25,7 @@ if st.pending:
     sys.exit("미정산(pending) 주문이 있습니다. 데몬이 정산하도록 두거나 manual_fills 를 사용하세요.")
 print("반영 전:", {k: getattr(st, k) for k in ("T", "cash", "hold_qty", "avg_price", "is_reverse")})
 shutil.copy2(path_for(sym), path_for(sym) + ".bak_before_fix")
-s = reconcile(st, [{"type": typ, "qty": qty, "price": price}], cfg["splits"])
+s = reconcile(st, [{"type": typ, "qty": qty, "price": price}], cfg["splits"], trade_date=st.order_date)
 save_state(sym, st)
 print("반영 후:", {k: getattr(st, k) for k in ("T", "cash", "hold_qty", "avg_price", "is_reverse")})
 print("경고:", s["warnings"] or "없음")

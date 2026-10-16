@@ -25,6 +25,7 @@ class V4State:
     reverse_day: int = 0          # 리버스 진입 후 정산 완료된 일수 (0 = 리버스 첫날)
     cycle_start_cash: float = 0.0  # 사이클 시작 시점 현금 (사이클 손익 계산용)
     cycle_buy_amt: float = 0.0     # 사이클 누적 매수액
+    cycle_start_date: str = ""     # 사이클 첫 매수일 (ET, YYYY-MM-DD)
     order_date: str = ""           # 마지막으로 주문을 접수한 날짜 (ET, YYYY-MM-DD)
     pending: List[dict] = field(default_factory=list)  # 접수됐지만 미정산인 주문
 
@@ -76,7 +77,7 @@ def calc_buy_orders(state: V4State, target_pct: float, splits: int, principal: f
         # 메리츠 MOC 미지원 방어: 전일 종가의 +15% 가격 설정 (LOC 주문용)
         first_buy_price = _r2(last_close * 1.15)
         return [{"type": "first_buy", "price": first_buy_price, "qty": qty,
-                 "amount": _r2(one_amount), "moc": False}]
+                 "amount": _r2(one_amount), "moc": False, "at_close": True}]
 
     star_point = calc_star_point(state.avg_price, target_pct, state.T, splits)
     buy_point = star_point - 0.01
@@ -123,7 +124,7 @@ def calc_reverse_orders(state: V4State, splits: int, last_5_avg: Optional[float]
     if state.reverse_day == 0 or not last_5_avg:
         if not last_close or last_close <= 0:
             raise ValueError("리버스 첫날 매도에는 직전 종가(last_close)가 필요합니다")
-        return [{"type": "reverse_sell", "price": _r2(last_close * 0.5), "qty": sell_qty, "moc": False}]
+        return [{"type": "reverse_sell", "price": _r2(last_close * 0.5), "qty": sell_qty, "moc": False, "at_close": True}]
 
     orders = [{"type": "reverse_sell", "price": _r2(last_5_avg), "qty": sell_qty}]
     buy_price = _r2(last_5_avg - 0.01)
@@ -193,7 +194,8 @@ def record_orders(state: V4State, orders: list, order_date: str):
     state.pending = [dict(o, placed=False, order_no=None) for o in orders if o.get("qty", 0) > 0]
 
 
-def reconcile(state: V4State, fills: List[Dict[str, Any]], splits: int) -> Dict[str, Any]:
+def reconcile(state: V4State, fills: List[Dict[str, Any]], splits: int,
+              trade_date: str = "") -> Dict[str, Any]:
     """실제 체결(fills)로 T/수량/평단/현금을 갱신하고 요약을 반환한다.
 
     fills: [{"type": "star_buy", "qty": 3, "price": 91.2}, ...]  (BUY/SELL 은 type 으로 판별)
@@ -212,6 +214,7 @@ def reconcile(state: V4State, fills: List[Dict[str, Any]], splits: int) -> Dict[
     if cycle_was_empty and buys:
         state.cycle_start_cash = state.cash
         state.cycle_buy_amt = 0.0
+        state.cycle_start_date = trade_date
 
     sell_qty = sell_amt = 0
     for _, q, p in sells:                       # 매도 먼저 (평단은 매도로 변하지 않음)
@@ -245,6 +248,7 @@ def reconcile(state: V4State, fills: List[Dict[str, Any]], splits: int) -> Dict[
         "sell_qty": sell_qty, "sell_price": (sell_amt / sell_qty) if sell_qty else 0.0,
         "T_before": T_before, "cycle_end": cycle_end, "warnings": warnings,
         "cycle_profit": 0.0, "cycle_buy_amt": state.cycle_buy_amt, "cycle_return_pct": 0.0,
+        "cycle_start_cash": state.cycle_start_cash, "cycle_start_date": state.cycle_start_date,
     }
     if cycle_end:
         profit = state.cash - state.cycle_start_cash
@@ -252,7 +256,7 @@ def reconcile(state: V4State, fills: List[Dict[str, Any]], splits: int) -> Dict[
         summary["cycle_return_pct"] = (profit / state.cycle_buy_amt * 100) if state.cycle_buy_amt else 0.0
         state.T, state.avg_price, state.hold_qty = 0.0, 0.0, 0
         state.is_reverse, state.reverse_day = False, 0
-        state.cycle_start_cash, state.cycle_buy_amt = 0.0, 0.0
+        state.cycle_start_cash, state.cycle_buy_amt, state.cycle_start_date = 0.0, 0.0, ""
     elif was_reverse:
         state.reverse_day += 1
 

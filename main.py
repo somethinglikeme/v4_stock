@@ -3,6 +3,7 @@
   python main.py --morning [--live] [TQQQ SOXL]    장중 주문 접수
   python main.py --aftermarket [--live] [TQQQ]      체결 정산
   python main.py --check                            실주문 전 API 점검(주문 없음)
+  python main.py --status [--send]                  장부·증권사 잔고 요약 출력(텔레그램 전송은 --send)
 기본은 DRY-RUN, 실주문/상태저장은 --live 를 줘야 한다.
 """
 import sys
@@ -39,24 +40,25 @@ if __name__ == "__main__":
     live = "--live" in args
     syms = [a.upper() for a in args if not a.startswith("--")] or list(PORTFOLIO)
     today = datetime.now(ET).date().isoformat()
-    if "--check" in args:
+    if "--status" in args:
+        from bot_daemon import build_status
+        text = build_status("📊 V4 상태")
+        print(text)
+        if "--send" in args:
+            send_telegram(text)
+    elif "--check" in args:
         preflight()
     elif "--morning" in args:
-        print(f"=== 장중 주문 접수 시작 (LIVE: {live}) ===")
         for s in syms:
             try:
                 morning_for_symbol(s, not live, today)
             except Exception as e:
-                print(f"❌ [{s}] 오류 발생: {e}")
                 send_telegram(f"❌ [{s}] 주문 오류: {e}")
-        print("=== 처리 완료 ===")        
     elif "--aftermarket" in args:
-        print(f"=== 장 마감 후 정산 시작 (LIVE: {live}) ===")
         for s in syms:
             try:
                 reconcile_for_symbol(s, not live)
             except Exception as e:
-                print(f"❌ [{s}] 정산 오류: {e}")
                 send_telegram(f"❌ [{s}] 정산 오류: {e}")
     else:
         print(__doc__)

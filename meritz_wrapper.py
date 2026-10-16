@@ -102,8 +102,9 @@ def _fail(path, j):
 
 
 # ------------------------------------------------------------------ 시세
-def get_last_close_yfinance(symbol):
-    """(직전 거래일 종가, 최근 5개 종가). 이름은 호환용. 진행 중인 당일 봉은 제외한다."""
+def get_last_close_yfinance(symbol, include_today=False):
+    """(직전 거래일 종가, 최근 5개 종가). 이름은 호환용. 진행 중인 당일 봉은 제외한다.
+    include_today=True 는 장 마감 후 당일 종가가 필요할 때만 사용한다."""
     _, cls = exch_for(symbol)
     _, j = _call("GET", "/market/v1/overseas/candles/days", params={
         "mrkt_div_code": "OV", "mrkt_cls_code": cls, "iscd": symbol,
@@ -111,7 +112,7 @@ def get_last_close_yfinance(symbol):
     if j.get("rsp_cd") != "0000":
         raise _fail("candles/days", j)
     today_et = datetime.now(ET).strftime("%Y%m%d")
-    rows = [r for r in (j.get("data") or []) if r.get("date") and r["date"] < today_et]
+    rows = [r for r in (j.get("data") or []) if r.get("date") and (r["date"] <= today_et if include_today else r["date"] < today_et)]
     rows.sort(key=lambda r: r["date"])
     closes = [(r["date"], float(r["prpr"])) for r in rows if float(r.get("prpr") or 0) > 0]
     if not closes:
@@ -209,7 +210,8 @@ def get_order_results(orders):
         out[str(o["order_no"])] = {
             "qty": 0 if rejected else int(float(r.get("cntg_dqty") or r.get("cntg_qty") or 0)),   # history=cntg_dqty, today=cntg_qty
             "price": float(r.get("cntg_crnc_prc") or 0),
-            "rejected": rejected, "reason": r.get("ovrs_stck_rfus_reas") or ""}
+            "rejected": rejected, "reason": r.get("ovrs_stck_rfus_reas") or "",
+            "filled_at": r.get("cntg_ymdh") or ""}
     return out
 
 

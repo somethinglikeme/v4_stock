@@ -31,6 +31,12 @@ python main.py --aftermarket [--live]      # 수동 정산
 수동 대체: `manual_fills_<SYMBOL>.json` 을 두면 그걸 우선 사용
 [{"type":"star_buy","qty":3,"price":91.2}]
 
+## 알림과 기록
+- 텔레그램: 시작 상태 / 주문 접수(LOC 매수·매도 등) / 장 마감 정산 / 사이클 종료 / 이상 알림 / 하루 1회 하트비트(21:00 KST, `HEARTBEAT_TIME_KST`)
+- 누적수익률 = (보유수량 × 체결가 + 남은금액 − 사이클 시작현금) ÷ 누적매수액. 평가가는 체결가(체결이 없으면 당일 종가)
+- 기록 파일(대시보드용, 데이터 폴더): `orders.csv`(주문) / `daily.csv`(정산) / `cycles.csv`(사이클). 컬럼이 바뀌면 기존 파일은 `.old_<시각>`으로 보존
+- `python main.py --status [--send]` 로 언제든 장부·증권사 잔고 요약 확인
+
 ## 복리 운용
 config.py 종목에 `"compound": True` 추가 (없으면 원금 기준)
 
