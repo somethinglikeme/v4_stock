@@ -111,12 +111,19 @@ def calc_sell_orders(state: V4State, target_pct: float, splits: int):
     ]
 
 
-def calc_reverse_orders(state: V4State, splits: int, last_5_avg: Optional[float]):
-    """리버스: 첫날 MOC 매도 / 이후 5일평균 LOC 매도 + 현금 1/4 LOC 매수."""
+def calc_reverse_orders(state: V4State, splits: int, last_5_avg: Optional[float],
+                        last_close: Optional[float] = None):
+    """리버스: 첫날 종가 매도(MOC 대체: 낮은 가격 LOC) / 이후 5일평균 LOC 매도 + 현금 1/4 LOC 매수.
+
+    메리츠는 해외주식 MOC 미지원 -> LOC 매도 하한가를 직전 종가의 50%로 둔다.
+    LOC 는 한도가 아니라 종가로 체결되므로 사실상 '종가 매도'와 같다.
+    """
     sell_qty = min(state.hold_qty, max(1, math.floor(state.hold_qty / (splits / 2)))) \
         if state.hold_qty > 0 else 0
     if state.reverse_day == 0 or not last_5_avg:
-        return [{"type": "reverse_sell", "price": None, "qty": sell_qty, "moc": True}]
+        if not last_close or last_close <= 0:
+            raise ValueError("리버스 첫날 매도에는 직전 종가(last_close)가 필요합니다")
+        return [{"type": "reverse_sell", "price": _r2(last_close * 0.5), "qty": sell_qty, "moc": False}]
 
     orders = [{"type": "reverse_sell", "price": _r2(last_5_avg), "qty": sell_qty}]
     buy_price = _r2(last_5_avg - 0.01)

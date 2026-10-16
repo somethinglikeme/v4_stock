@@ -3,3 +3,4 @@ requests
 yfinance
 pandas
 schedule
+exchange_calendars

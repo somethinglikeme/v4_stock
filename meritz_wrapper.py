@@ -62,8 +62,14 @@ def get_meritz_token(force=False):
 
 
 def _call(method, path, params=None, body=None, retries=3):
-    """공통 호출. (http_status, json) 반환. 초당 호출 제한(EGW00200)은 자동 재시도."""
-    for attempt in range(retries):
+    """공통 호출. (http_status, json) 반환.
+
+    - EGW00200(초당 호출 제한): 최대 retries 회까지 대기 후 재시도
+    - EGW00121/HTTP 401(토큰 만료·무효): 토큰을 새로 발급해 1회 재시도. 이 오류는 요청이 처리되기 전에
+      거절되는 것이라 주문 호출도 안전하게 재시도할 수 있다.
+    """
+    refreshed, attempt = False, 0
+    while True:
         token = get_meritz_token()
         if not token:
             raise RuntimeError("메리츠 토큰 없음 - .env 의 키를 확인하세요")
@@ -75,14 +81,20 @@ def _call(method, path, params=None, body=None, retries=3):
             j = res.json()
         except ValueError:
             raise RuntimeError(f"{path} 비JSON 응답 HTTP {res.status_code}: {res.text[:200]}")
-        if j.get("rsp_cd") == "EGW00200":
-            time.sleep(1.0 * (attempt + 1))
-            continue
-        if res.status_code == 401:
-            get_meritz_token(force=True)
+        code = j.get("rsp_cd")
+        if code == "EGW00121" or res.status_code == 401:
+            if not refreshed:
+                refreshed = True
+                get_meritz_token(force=True)
+                continue
+            return res.status_code, j
+        if code == "EGW00200":
+            attempt += 1
+            if attempt >= retries:
+                raise RuntimeError(f"{path} 호출 제한(EGW00200) 재시도 초과")
+            time.sleep(1.0 * attempt)
             continue
         return res.status_code, j
-    raise RuntimeError(f"{path} 호출 제한/인증 재시도 초과")
 
 
 def _fail(path, j):

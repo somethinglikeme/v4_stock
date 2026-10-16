@@ -112,7 +112,7 @@ def morning_for_symbol(symbol: str, dry_run: bool, today: str):
         send_telegram(f"[{symbol}] {m}")
 
     if state.is_reverse:
-        orders = calc_reverse_orders(state, splits, last5_avg)
+        orders = calc_reverse_orders(state, splits, last5_avg, last_close)
     else:
         orders = calc_buy_orders(state, target, splits, principal, last_close, compound) + \
                  calc_sell_orders(state, target, splits)
