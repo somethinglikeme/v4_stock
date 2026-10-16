@@ -207,7 +207,7 @@ def get_order_results(orders):
         r = cands[0]
         rejected = str(r.get("ovrs_stck_oder_stat_cls_code", "0")) != "0"
         out[str(o["order_no"])] = {
-            "qty": 0 if rejected else int(float(r.get("cntg_qty") or 0)),
+            "qty": 0 if rejected else int(float(r.get("cntg_dqty") or r.get("cntg_qty") or 0)),   # history=cntg_dqty, today=cntg_qty
             "price": float(r.get("cntg_crnc_prc") or 0),
             "rejected": rejected, "reason": r.get("ovrs_stck_rfus_reas") or ""}
     return out

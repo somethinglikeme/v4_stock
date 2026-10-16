@@ -95,6 +95,13 @@ def morning_for_symbol(symbol: str, dry_run: bool, today: str):
             send_telegram(f"⛔ [{symbol}] {state.order_date} 주문이 미정산 상태라 신규 주문을 중단했습니다. 정산(체결 반영) 후 재개됩니다.")
         return
 
+    if not dry_run and os.getenv("V4_SKIP_BALANCE_CHECK", "0") != "1":
+        pos = get_position(symbol)     # 조회 실패 시 예외 -> 재시도 (확인 없이 주문하지 않음)
+        if int(round(pos["qty"])) != state.hold_qty:
+            send_telegram(f"⛔ [{symbol}] 증권사 보유 {pos['qty']:g}주 ≠ 장부 {state.hold_qty}주 - 중복 주문 방지를 위해 오늘 주문을 중단했습니다. "
+                          f"장부(state_{symbol}.json)를 실제 체결에 맞춘 뒤 데몬을 재시작하세요.")
+            return
+
     last_close, last5 = get_last_close_yfinance(symbol)
     if last_close <= 0:
         raise RuntimeError(f"{symbol} 종가 이상: {last_close}")
